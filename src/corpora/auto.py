@@ -216,6 +216,96 @@ def get_lambada(
     return processed_dataset
 
 
+def get_maestro(
+    paths: Dict[str, Path],
+    dataset_id: str = "maestro",
+    dataset_name: str = None,
+    validation_ratio: float = 0.0005,
+    seq_len: int = 1024,
+    preprocessing_num_proc: int = 4,
+    stride: int = -1,
+    ignore_train: bool = False,
+    data_dir = None,
+) -> datasets.DatasetDict:
+    """
+    Run special tokenization and grouping for the MAESTRO dataset.
+    """
+    overwatch.info(f"Preprocessing MAESTRO Dataset via Multiprocessing with `{preprocessing_num_proc}` threads...")
+
+    # Sanity check on Input Arguments
+    stride = seq_len if stride < 0 else stride
+
+    assert stride <= seq_len, f"Data grouping stride ({stride}) is smaller than sequence length; we are losing data."
+    dataset = datasets.load_dataset(dataset_id, dataset_name, data_dir=data_dir, cache_dir=str(paths["dataset"]), keep_in_memory=True)
+
+    #dataset = datasets.load_dataset("wikitext", name="wikitext-103-raw-v1", cache_dir=str(paths["dataset"]), keep_in_memory=True)
+    #from transformers import GPT2Tokenizer
+    #tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+
+    def tokenize(examples: Dict[str, List[str]]) -> BatchEncoding:
+        results = dict()
+        results["input_ids"] = [[int(token) for token in seq.strip().split(' ')] for seq in examples["text"]]
+        results["attention_mask"] = [[1 for token in seq.strip().split(' ')] for seq in examples["text"]]
+        return results
+
+    overwatch.info(f"Tokenizing Dataset via Multiprocessing with `{preprocessing_num_proc}` threads...")
+
+    post_tokenization_cache_files = {
+        k: str(paths["preprocessed"] / dataset_id / "preprocessing" / "tokenization" / f"{k}-tokenized.hf")
+        for k in dataset
+    }
+    (paths["preprocessed"] / dataset_id / "preprocessing" / "tokenization").mkdir(parents=True, exist_ok=True)
+
+    tokenized_dataset = dataset.map(
+        tokenize,
+        batched=True,
+        num_proc=preprocessing_num_proc,
+        remove_columns=next(iter(dataset.values())).column_names,
+        cache_file_names=post_tokenization_cache_files,
+        load_from_cache_file=True,
+    )
+
+    # run chunking (collapse multiple sequences into a giant document to read `seq_len` chunks from)
+    def group(examples: Dict[str, Iterable[List[int]]]) -> Dict[str, List[List[int]]]:
+        # Concatenate all the Texts
+        concatenated = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated[list(examples.keys())[0]])
+
+        # Drop the "very last" bit of the dataset that doesn't fit into block size...
+        total_length = ((total_length - seq_len + stride) // stride) * stride
+
+        # Split by Chunks of Maximum Length
+        result = {k: [t[i : i + seq_len] for i in range(0, total_length, stride)] for k, t in concatenated.items()}
+        result["labels"] = deepcopy(result["input_ids"])
+
+        # Mask out losses in overlapping regions. If training data, string will be equal to seq_len
+        for i, labels in enumerate(result["labels"]):
+            if i == 0:
+                continue
+            for j in range(len(labels) - stride):
+                labels[j] = -100
+            result["labels"][i] = labels
+        return result
+
+    # Create Post-Chunking Cache Paths
+    post_chunking_cache_files = {
+        k: str(paths["preprocessed"] / dataset_id / "preprocessing" / "chunking" / f"{k}-stride={stride}-chunked.hf")
+        for k in dataset
+    }
+    # Create Parent Path of Cache Files
+    (paths["preprocessed"] / dataset_id / "preprocessing" / "chunking").mkdir(parents=True, exist_ok=True)
+
+    lm_dataset = tokenized_dataset.map(
+        group,
+        batched=True,
+        num_proc=preprocessing_num_proc,
+        cache_file_names=post_chunking_cache_files,
+        load_from_cache_file=True,
+    )
+
+    return lm_dataset
+
+
 # Mapping of eval dataset name -> HF ids, names, and method for generating dataset
 ONLINE_EVAL_DATA_REGISTRY = {
     "wikitext": {"id": "wikitext", "name": "wikitext-103-raw-v1", "generator": get_auto_dataset},

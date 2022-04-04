@@ -34,8 +34,8 @@ from transformers.trainer_utils import get_last_checkpoint
 from conf.train_schema import get_schema
 from src.args import get_training_arguments
 from src.core import CustomCheckpointCallback, CustomWandbCallback, OnlineBenchmarkTrainer
-from src.corpora import ONLINE_EVAL_DATA_REGISTRY, get_auto_dataset
-from src.models import get_auto_clm_tokenizer
+from src.corpora import ONLINE_EVAL_DATA_REGISTRY, get_maestro
+from src.models import get_auto_clm
 from src.overwatch import get_overwatch
 from src.util import create_paths, set_permissions
 
@@ -90,47 +90,31 @@ def train() -> OnlineBenchmarkTrainer:
             model_configs = json.load(f)
     else:
         model_configs = None
-    model, tokenizer = get_auto_clm_tokenizer(
+
+    model = get_auto_clm(
         quinfig.model.id,
         paths,
         model_configs=model_configs,
         gradient_checkpointing=quinfig.model.gradient_checkpointing,
-        use_pretrained_tokenizer=quinfig.model.pretrained_tokenizer,
         reorder_and_upcast_attn=quinfig.model.reorder_and_upcast_attn,
         scale_attn_by_inverse_layer_idx=quinfig.model.scale_attn_by_inverse_layer_idx,
         initial_weights=quinfig.model.initial_weights,
     )
 
+    print('Parameters: ', sum([np.prod(parm.shape) for parm in model.parameters() if parm.requires_grad]))
+
     # Load Dataset w/ Preprocessing, Batching, and Collating
-    overwatch.info(f"Downloading and Preprocessing Dataset `{quinfig.dataset.id}`...")
-    lm_dataset = get_auto_dataset(
-        tokenizer,
+    overwatch.info(f"Preprocessing Dataset `{quinfig.dataset.id}`...")
+    lm_dataset = get_maestro(
         paths,
         dataset_id=quinfig.dataset.id,
         dataset_name=quinfig.dataset.name,
         validation_ratio=quinfig.dataset.validation_ratio,
         seq_len=quinfig.model.seq_len,
         preprocessing_num_proc=quinfig.dataset.num_proc,
+#        data_dir = '/nlp/scr/jthickstun/maestro'
+        data_dir = '/nlp/scr/jthickstun/fma_full'
     )
-
-    # Load Online Eval Datasets
-    custom_eval_datasets = dict()
-    for eval_dataset_arg in list(filter(lambda x: x.startswith("do_"), quinfig.online_eval.keys())):
-        if getattr(quinfig.online_eval, eval_dataset_arg):
-            # Dataset name is in quinfig arg of "do_<dataset>" -> Boolean
-            dataset_name = eval_dataset_arg.lstrip("do_")
-            overwatch.info(f"Downloading and Preprocessing Online Eval Dataset {dataset_name}")
-            custom_eval_datasets[dataset_name] = ONLINE_EVAL_DATA_REGISTRY[dataset_name]["generator"](
-                tokenizer,
-                paths,
-                dataset_id=ONLINE_EVAL_DATA_REGISTRY[dataset_name]["id"],
-                dataset_name=ONLINE_EVAL_DATA_REGISTRY[dataset_name]["name"],
-                validation_ratio=quinfig.dataset.validation_ratio,
-                seq_len=quinfig.model.seq_len,
-                stride=quinfig.online_eval.stride,
-                preprocessing_num_proc=quinfig.dataset.eval_num_proc,
-                ignore_train=True,
-            )["validation"]
 
     # Fix All Dataset Permissions
     set_permissions(paths)
@@ -165,8 +149,6 @@ def train() -> OnlineBenchmarkTrainer:
         data_collator=default_data_collator,  # De Facto Collator uses Padding, which we DO NOT want!
         train_dataset=lm_dataset["train"],
         eval_dataset=lm_dataset["validation"],
-        custom_eval_datasets=custom_eval_datasets,
-        tokenizer=tokenizer,
         callbacks=[
             CustomWandbCallback(
                 quinfig.wandb,
