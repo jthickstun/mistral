@@ -1,0 +1,13 @@
+# maestro.yaml
+#   Configuration for MAESTRO Dataset (https://magenta.tensorflow.org/datasets/maestro).
+---
+dataset:
+    id: src/corpora/maestro.py
+    name: maestro-v1.0.0
+    validation_ratio: null
+
+    # Number of Preprocessing Workers
+    num_proc: 4
+
+    # Number of Evaluation Preprocessing Workers
+    eval_num_proc: 4
